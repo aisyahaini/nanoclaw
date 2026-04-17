@@ -361,25 +361,66 @@ export class WhatsAppChannel implements Channel {
       );
       return;
     }
-    try {
-      const sent = await this.sock.sendMessage(jid, { text: prefixed });
-      // Cache for retry requests (recipient may ask us to re-encrypt)
-      if (sent?.key?.id && sent.message) {
-        this.sentMessageCache.set(sent.key.id, sent.message);
-        if (this.sentMessageCache.size > 256) {
-          const oldest = this.sentMessageCache.keys().next().value!;
-          this.sentMessageCache.delete(oldest);
+    const trySend = async (attempt: number): Promise<void> => {
+      try {
+        const sent = await this.sock.sendMessage(jid, { text: prefixed });
+        // Cache for retry requests (recipient may ask us to re-encrypt)
+        if (sent?.key?.id && sent.message) {
+          this.sentMessageCache.set(sent.key.id, sent.message);
+          if (this.sentMessageCache.size > 256) {
+            const oldest = this.sentMessageCache.keys().next().value!;
+            this.sentMessageCache.delete(oldest);
+          }
+        }
+        logger.info({ jid, length: prefixed.length }, 'Message sent');
+      } catch (err) {
+        const isSessionError =
+          err instanceof Error && err.message === 'No sessions';
+        if (isSessionError && attempt < 3) {
+          // Signal sessions may not be established yet — wait and retry
+          logger.warn(
+            { jid, attempt },
+            'No sessions error, retrying after delay',
+          );
+          await new Promise((r) => setTimeout(r, 3000 * attempt));
+          return trySend(attempt + 1);
+        }
+        // If send fails, queue it for retry
+        this.outgoingQueue.push({ jid, text: prefixed });
+        logger.warn(
+          { jid, err, queueSize: this.outgoingQueue.length },
+          'Failed to send, message queued',
+        );
+
+        if (isSessionError && jid.endsWith('@g.us')) {
+          // Parse the dead device address from the libsignal stack trace.
+          // libsignal throws "SessionError: No sessions\n  at {user}.{device} [as awaitable]"
+          const m =
+            err instanceof Error && err.stack
+              ? err.stack.match(/at (\d+)\.(\d+) \[as awaitable\]/)
+              : null;
+          if (m) {
+            const [, user, device] = m;
+            const deadJid = `${user}:${device}@s.whatsapp.net`;
+            this.markDeadDevice(jid, deadJid);
+            // Retry with the dead device now skipped in sender-key-memory
+            setTimeout(() => {
+              this.flushOutgoingQueue().catch((e) =>
+                logger.warn({ e }, 'Flush after dead device fix failed'),
+              );
+            }, 500);
+          } else {
+            // Unknown session error — force reconnect to re-fetch prekeys
+            logger.warn(
+              { jid },
+              'No sessions after all retries — forcing reconnect to re-fetch prekeys',
+            );
+            this.sock.end(undefined);
+          }
         }
       }
-      logger.info({ jid, length: prefixed.length }, 'Message sent');
-    } catch (err) {
-      // If send fails, queue it for retry on reconnect
-      this.outgoingQueue.push({ jid, text: prefixed });
-      logger.warn(
-        { jid, err, queueSize: this.outgoingQueue.length },
-        'Failed to send, message queued',
-      );
-    }
+    };
+    await trySend(1);
   }
 
   isConnected(): boolean {
@@ -499,20 +540,26 @@ export class WhatsAppChannel implements Channel {
     }
 
     const metadata = await this.sock.groupMetadata(jid);
-    const participants = await Promise.all(
-      metadata.participants.map(async (participant) => ({
-        ...participant,
-        id: await this.translateJid(participant.id),
-      })),
-    );
+    const botLid = this.botLidUser;
+
+    // Keep participant IDs in their original LID format so Baileys can look up
+    // Signal sessions by the correct key. Translating LID→phone here causes
+    // "No sessions" because sessions are indexed by LID.
+    // Exclude the bot's own LID entry so Baileys doesn't attempt self-encryption.
+    const participants = botLid
+      ? metadata.participants.filter(
+          (p) => !p.id.startsWith(`${botLid}@`) && !p.id.startsWith(`${botLid}:`),
+        )
+      : metadata.participants;
+
     const normalized = { ...metadata, participants };
-    const mappedCount = participants.filter(
-      (participant, index) =>
-        participant.id !== metadata.participants[index]?.id,
-    ).length;
 
     logger.info(
-      { jid, participantCount: participants.length, mappedCount },
+      {
+        jid,
+        participantCount: participants.length,
+        totalCount: metadata.participants.length,
+      },
       'Prepared normalized group metadata for send',
     );
 
@@ -521,6 +568,38 @@ export class WhatsAppChannel implements Channel {
       expiresAt: Date.now() + 60_000,
     });
     return normalized;
+  }
+
+  /**
+   * Mark a device as "already has sender key" in Baileys' sender-key-memory so
+   * it is skipped during group sender-key distribution.
+   *
+   * WhatsApp sometimes returns dead/inactive devices via getUSyncDevices that
+   * no longer have prekeys on the server. When assertSessions() fails for such a
+   * device, Baileys cannot encrypt the sender-key distribution message and throws
+   * SessionError. By marking the dead device as already having received the
+   * sender key we skip that device on every future send so the group message
+   * reaches the remaining (live) devices successfully.
+   */
+  private markDeadDevice(groupJid: string, deadDeviceJid: string): void {
+    try {
+      const authDir = path.join(STORE_DIR, 'auth');
+      // Filename mirrors Baileys' fixFileName: replace / → __ and : → -
+      const safeJid = groupJid.replace(/\//g, '__').replace(/:/g, '-');
+      const memFile = path.join(authDir, `sender-key-memory-${safeJid}.json`);
+      let map: Record<string, boolean> = {};
+      if (fs.existsSync(memFile)) {
+        map = JSON.parse(fs.readFileSync(memFile, 'utf-8'));
+      }
+      map[deadDeviceJid] = true;
+      fs.writeFileSync(memFile, JSON.stringify(map));
+      logger.info(
+        { groupJid, deadDeviceJid },
+        'Dead device marked in sender-key-memory — will be skipped on next send',
+      );
+    } catch (err) {
+      logger.warn({ groupJid, deadDeviceJid, err }, 'Failed to mark dead device');
+    }
   }
 
   private async flushOutgoingQueue(): Promise<void> {
@@ -532,16 +611,25 @@ export class WhatsAppChannel implements Channel {
         'Flushing outgoing message queue',
       );
       while (this.outgoingQueue.length > 0) {
-        const item = this.outgoingQueue.shift()!;
-        // Send directly — queued items are already prefixed by sendMessage
-        const sent = await this.sock.sendMessage(item.jid, { text: item.text });
-        if (sent?.key?.id && sent.message) {
-          this.sentMessageCache.set(sent.key.id, sent.message);
+        const item = this.outgoingQueue[0]; // peek — don't remove until send succeeds
+        try {
+          // Send directly — queued items are already prefixed by sendMessage
+          const sent = await this.sock.sendMessage(item.jid, { text: item.text });
+          if (sent?.key?.id && sent.message) {
+            this.sentMessageCache.set(sent.key.id, sent.message);
+          }
+          this.outgoingQueue.shift(); // remove only after successful send
+          logger.info(
+            { jid: item.jid, length: item.text.length },
+            'Queued message sent',
+          );
+        } catch (err) {
+          logger.warn(
+            { jid: item.jid, err },
+            'Failed to flush queued message — will retry on next connect',
+          );
+          break; // leave message in queue for next flush
         }
-        logger.info(
-          { jid: item.jid, length: item.text.length },
-          'Queued message sent',
-        );
       }
     } finally {
       this.flushing = false;

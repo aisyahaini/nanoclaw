@@ -55,6 +55,11 @@ export function hasSystemd(): boolean {
  */
 export function openBrowser(url: string): boolean {
   try {
+    // Windows support
+    if (process.platform === 'win32') {
+      execSync(`cmd /c start "" "${url}"`, { stdio: 'ignore' });
+      return true;
+    }
     const platform = getPlatform();
     if (platform === 'macos') {
       execSync(`open ${JSON.stringify(url)}`, { stdio: 'ignore' });
@@ -108,7 +113,9 @@ export function getNodePath(): string {
 
 export function commandExists(name: string): boolean {
   try {
-    execSync(`command -v ${name}`, { stdio: 'ignore' });
+    const cmd =
+      process.platform === 'win32' ? `where ${name}` : `command -v ${name}`;
+    execSync(cmd, { stdio: 'ignore' });
     return true;
   } catch {
     return false;

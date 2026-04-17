@@ -111,7 +111,7 @@ async function syncGroups(projectRoot: string): Promise<void> {
   let syncOk = false;
   try {
     const syncScript = `
-import makeWASocket, { useMultiFileAuthState, makeCacheableSignalKeyStore, Browsers } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, Browsers, fetchLatestWaWebVersion } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import path from 'path';
 import fs from 'fs';
@@ -136,11 +136,15 @@ const upsert = db.prepare(
 
 const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
+const { version } = await fetchLatestWaWebVersion();
+
 const sock = makeWASocket({
+  version,
   auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
   printQRInTerminal: false,
   logger,
   browser: Browsers.macOS('Chrome'),
+  markOnlineOnConnect: false,
 });
 
 const timeout = setTimeout(() => {
@@ -182,7 +186,7 @@ sock.ev.on('connection.update', async (update) => {
     const tmpScript = path.join(projectRoot, '.tmp-group-sync.mjs');
     fs.writeFileSync(tmpScript, syncScript, 'utf-8');
     try {
-      const output = execSync(`node ${tmpScript}`, {
+      const output = execSync(`node "${tmpScript}"`, {
         cwd: projectRoot,
         encoding: 'utf-8',
         timeout: 45000,

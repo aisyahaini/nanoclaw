@@ -265,6 +265,11 @@ async function buildContainerArgs(
       { containerName },
       'OneCLI gateway not reachable — container will have no credentials',
     );
+    // Fallback: pass ANTHROPIC_API_KEY directly if set in environment
+    if (process.env.ANTHROPIC_API_KEY) {
+      args.push('-e', `ANTHROPIC_API_KEY=${process.env.ANTHROPIC_API_KEY}`);
+      logger.info({ containerName }, 'Injecting ANTHROPIC_API_KEY from env');
+    }
   }
 
   // Runtime-specific args for host gateway resolution
