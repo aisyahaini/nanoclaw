@@ -548,7 +548,8 @@ export class WhatsAppChannel implements Channel {
     // Exclude the bot's own LID entry so Baileys doesn't attempt self-encryption.
     const participants = botLid
       ? metadata.participants.filter(
-          (p) => !p.id.startsWith(`${botLid}@`) && !p.id.startsWith(`${botLid}:`),
+          (p) =>
+            !p.id.startsWith(`${botLid}@`) && !p.id.startsWith(`${botLid}:`),
         )
       : metadata.participants;
 
@@ -598,7 +599,10 @@ export class WhatsAppChannel implements Channel {
         'Dead device marked in sender-key-memory — will be skipped on next send',
       );
     } catch (err) {
-      logger.warn({ groupJid, deadDeviceJid, err }, 'Failed to mark dead device');
+      logger.warn(
+        { groupJid, deadDeviceJid, err },
+        'Failed to mark dead device',
+      );
     }
   }
 
@@ -614,7 +618,9 @@ export class WhatsAppChannel implements Channel {
         const item = this.outgoingQueue[0]; // peek — don't remove until send succeeds
         try {
           // Send directly — queued items are already prefixed by sendMessage
-          const sent = await this.sock.sendMessage(item.jid, { text: item.text });
+          const sent = await this.sock.sendMessage(item.jid, {
+            text: item.text,
+          });
           if (sent?.key?.id && sent.message) {
             this.sentMessageCache.set(sent.key.id, sent.message);
           }
